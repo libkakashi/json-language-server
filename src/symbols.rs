@@ -23,64 +23,88 @@ fn children_symbols(doc: &Document, node: Node<'_>) -> Vec<DocumentSymbol> {
 }
 
 fn object_symbols(doc: &Document, object: Node<'_>) -> Vec<DocumentSymbol> {
+    let mut result = Vec::with_capacity(object.named_child_count());
     let mut cursor = object.walk();
-    let pairs = tree::object_pairs(object, &mut cursor);
 
-    pairs
-        .iter()
-        .filter_map(|pair| {
-            let key_node = pair.child_by_field_name("key")?;
-            let name = tree::string_content(key_node, doc.source())?.to_string();
+    if !cursor.goto_first_child() {
+        return result;
+    }
 
-            let value_node = tree::pair_value(*pair);
-            let (detail, kind) = match &value_node {
-                Some(v) => (value_detail(doc, *v), node_symbol_kind(*v)),
-                None => (None, SymbolKind::NULL),
-            };
+    let source = doc.source();
 
-            let range = doc.range_of(pair.start_byte(), pair.end_byte());
-            let selection_range = doc.range_of(key_node.start_byte(), key_node.end_byte());
+    loop {
+        let pair = cursor.node();
+        if pair.kind() == kinds::PAIR {
+            if let Some(sym) = pair_symbol(doc, source, pair) {
+                result.push(sym);
+            }
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
 
-            let children = value_node.and_then(|v| match v.kind() {
-                kinds::OBJECT | kinds::ARRAY => Some(children_symbols(doc, v)),
-                _ => None,
-            });
+    result
+}
 
-            #[allow(deprecated)]
-            Some(DocumentSymbol {
-                name,
-                detail,
-                kind,
-                tags: None,
-                deprecated: None,
-                range,
-                selection_range,
-                children,
-            })
-        })
-        .collect()
+#[inline]
+fn pair_symbol(doc: &Document, source: &[u8], pair: Node<'_>) -> Option<DocumentSymbol> {
+    let key_node = pair.child_by_field_name("key")?;
+    let name = tree::string_content(key_node, source)?.to_string();
+
+    let value_node = tree::pair_value(pair);
+    let (detail, kind) = match &value_node {
+        Some(v) => (value_detail(source, *v), node_symbol_kind(*v)),
+        None => (None, SymbolKind::NULL),
+    };
+
+    let range = doc.range_of(pair.start_byte(), pair.end_byte());
+    let selection_range = doc.range_of(key_node.start_byte(), key_node.end_byte());
+
+    let children = value_node.and_then(|v| match v.kind() {
+        kinds::OBJECT | kinds::ARRAY => Some(children_symbols(doc, v)),
+        _ => None,
+    });
+
+    #[allow(deprecated)]
+    Some(DocumentSymbol {
+        name,
+        detail,
+        kind,
+        tags: None,
+        deprecated: None,
+        range,
+        selection_range,
+        children,
+    })
 }
 
 fn array_symbols(doc: &Document, array: Node<'_>) -> Vec<DocumentSymbol> {
+    let mut result = Vec::with_capacity(array.named_child_count());
     let mut cursor = array.walk();
-    let items = tree::array_items(array, &mut cursor);
 
-    items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let name = format!("[{i}]");
-            let detail = value_detail(doc, *item);
-            let kind = node_symbol_kind(*item);
+    if !cursor.goto_first_child() {
+        return result;
+    }
+
+    let source = doc.source();
+    let mut index = 0usize;
+
+    loop {
+        let item = cursor.node();
+        if tree::is_value_node(&item) {
+            let name = format!("[{index}]");
+            let detail = value_detail(source, item);
+            let kind = node_symbol_kind(item);
             let range = doc.range_of(item.start_byte(), item.end_byte());
 
             let children = match item.kind() {
-                kinds::OBJECT | kinds::ARRAY => Some(children_symbols(doc, *item)),
+                kinds::OBJECT | kinds::ARRAY => Some(children_symbols(doc, item)),
                 _ => None,
             };
 
             #[allow(deprecated)]
-            DocumentSymbol {
+            result.push(DocumentSymbol {
                 name,
                 detail,
                 kind,
@@ -89,11 +113,18 @@ fn array_symbols(doc: &Document, array: Node<'_>) -> Vec<DocumentSymbol> {
                 range,
                 selection_range: range,
                 children,
-            }
-        })
-        .collect()
+            });
+            index += 1;
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    result
 }
 
+#[inline]
 fn node_symbol_kind(node: Node<'_>) -> SymbolKind {
     match node.kind() {
         kinds::OBJECT => SymbolKind::OBJECT,
@@ -103,6 +134,32 @@ fn node_symbol_kind(node: Node<'_>) -> SymbolKind {
         kinds::TRUE | kinds::FALSE => SymbolKind::BOOLEAN,
         kinds::NULL => SymbolKind::NULL,
         _ => SymbolKind::KEY,
+    }
+}
+
+#[inline]
+fn value_detail(source: &[u8], node: Node<'_>) -> Option<String> {
+    match node.kind() {
+        kinds::STRING => {
+            let s = tree::string_content(node, source)?;
+            if s.len() > 60 {
+                Some(format!("\"{}...\"", &s[..57]))
+            } else {
+                Some(format!("\"{s}\""))
+            }
+        }
+        kinds::NUMBER | kinds::TRUE | kinds::FALSE | kinds::NULL => {
+            Some(node.utf8_text(source).ok()?.to_string())
+        }
+        kinds::OBJECT => {
+            let count = tree::object_pair_count(node);
+            Some(format!("{{{count} properties}}"))
+        }
+        kinds::ARRAY => {
+            let count = tree::array_item_count(node);
+            Some(format!("[{count} items]"))
+        }
+        _ => None,
     }
 }
 
@@ -155,7 +212,6 @@ mod tests {
     fn root_array_no_symbols() {
         let doc = Document::new("[1, 2, 3]".into(), 0);
         let syms = document_symbols(&doc);
-        // Root array items get symbols with [0], [1], etc.
         assert_eq!(syms.len(), 3);
     }
 
@@ -180,32 +236,5 @@ mod tests {
         let doc = Document::new("".into(), 0);
         let syms = document_symbols(&doc);
         assert!(syms.is_empty());
-    }
-}
-
-fn value_detail(doc: &Document, node: Node<'_>) -> Option<String> {
-    match node.kind() {
-        kinds::STRING => {
-            let s = tree::string_content(node, doc.source())?;
-            if s.len() > 60 {
-                Some(format!("\"{}...\"", &s[..57]))
-            } else {
-                Some(format!("\"{s}\""))
-            }
-        }
-        kinds::NUMBER | kinds::TRUE | kinds::FALSE | kinds::NULL => {
-            Some(node.utf8_text(doc.source()).ok()?.to_string())
-        }
-        kinds::OBJECT => {
-            let mut cursor = node.walk();
-            let count = tree::object_pairs(node, &mut cursor).len();
-            Some(format!("{{{count} properties}}"))
-        }
-        kinds::ARRAY => {
-            let mut cursor = node.walk();
-            let count = tree::array_items(node, &mut cursor).len();
-            Some(format!("[{count} items]"))
-        }
-        _ => None,
     }
 }

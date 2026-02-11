@@ -7,139 +7,42 @@
 /// - A per-document `JsonParser` instance
 use std::collections::HashMap;
 
+use line_index::{LineCol, LineIndex, WideEncoding, WideLineCol};
 use tower_lsp::lsp_types::{Position, Range, Url};
 use tree_sitter::Tree;
 
 use crate::tree::{self, JsonParser};
 
 // ---------------------------------------------------------------------------
-// Line index — fast UTF-16 <-> byte offset conversion
+// Helpers: line-index <-> LSP type conversion
 // ---------------------------------------------------------------------------
 
-/// Pre-computed line start offsets for a document.
-///
-/// LSP positions use (line, character) where character is in UTF-16 code
-/// units. Tree-sitter uses byte offsets. This index makes both conversions
-/// O(1) for the line lookup + O(line_length) for the column.
-pub struct LineIndex {
-    /// Byte offset of the start of each line. Index 0 is always 0.
-    line_starts: Vec<usize>,
+#[inline]
+fn to_lsp_position(index: &LineIndex, offset: line_index::TextSize) -> Position {
+    let line_col = index.line_col(offset);
+    let wide = index
+        .to_wide(WideEncoding::Utf16, line_col)
+        .unwrap_or(WideLineCol {
+            line: line_col.line,
+            col: line_col.col,
+        });
+    Position {
+        line: wide.line,
+        character: wide.col,
+    }
 }
 
-impl LineIndex {
-    pub fn new(text: &str) -> Self {
-        let mut starts = vec![0usize];
-        for (i, b) in text.bytes().enumerate() {
-            if b == b'\n' {
-                starts.push(i + 1);
-            }
-        }
-        LineIndex {
-            line_starts: starts,
-        }
-    }
-
-    /// Incrementally update line starts after a text edit.
-    /// `start_byte` is where the edit begins, `old_len` is the byte length
-    /// of the removed region, `new_text` is the replacement text.
-    pub fn update(&mut self, text: &str, start_byte: usize, old_len: usize, new_text: &str) {
-        let old_end = start_byte + old_len;
-        let new_len = new_text.len();
-        let delta = new_len as isize - old_len as isize;
-
-        // Find the range of lines affected by the edit.
-        // First line that starts at or after start_byte+1 (lines whose start
-        // was within or after the old region).
-        let first_removed = self.line_starts.partition_point(|&s| s <= start_byte);
-        let last_removed = self.line_starts.partition_point(|&s| s <= old_end);
-
-        // Remove the line starts that fell inside the old region.
-        // These will be replaced by new line starts from the replacement text.
-        let lines_after: Vec<usize> = self.line_starts[last_removed..]
-            .iter()
-            .map(|&s| (s as isize + delta) as usize)
-            .collect();
-
-        // Compute new line starts within the replacement text.
-        let mut new_starts = Vec::new();
-        for (i, b) in new_text.bytes().enumerate() {
-            if b == b'\n' {
-                new_starts.push(start_byte + i + 1);
-            }
-        }
-
-        // Rebuild: keep lines before the edit, add new interior lines,
-        // then shifted lines after.
-        self.line_starts.truncate(first_removed);
-        self.line_starts.extend(new_starts);
-        self.line_starts.extend(lines_after);
-
-        // Safety: if something went wrong, fall back to full rebuild.
-        // This should never happen, but protects against edge cases.
-        if self.line_starts.is_empty() || self.line_starts[0] != 0 {
-            *self = LineIndex::new(text);
-        }
-    }
-
-    pub fn line_count(&self) -> usize {
-        self.line_starts.len()
-    }
-
-    /// Convert an LSP `Position` (line, character in UTF-16 CUs) to a byte offset.
-    pub fn offset_of(&self, text: &str, pos: Position) -> usize {
-        let line = pos.line as usize;
-        if line >= self.line_starts.len() {
-            return text.len();
-        }
-        let line_start = self.line_starts[line];
-        let line_text = if line + 1 < self.line_starts.len() {
-            &text[line_start..self.line_starts[line + 1]]
-        } else {
-            &text[line_start..]
-        };
-
-        let mut utf16_offset = 0u32;
-        let mut byte_offset = 0usize;
-        for ch in line_text.chars() {
-            if utf16_offset >= pos.character {
-                break;
-            }
-            utf16_offset += ch.len_utf16() as u32;
-            byte_offset += ch.len_utf8();
-        }
-
-        line_start + byte_offset
-    }
-
-    /// Convert a byte offset to an LSP `Position`.
-    pub fn position_of(&self, text: &str, offset: usize) -> Position {
-        let offset = offset.min(text.len());
-
-        // Binary search for the line.
-        let line = match self.line_starts.binary_search(&offset) {
-            Ok(exact) => exact,
-            Err(insert) => insert.saturating_sub(1),
-        };
-
-        let line_start = self.line_starts[line];
-        let prefix = &text[line_start..offset];
-
-        // Count UTF-16 code units for the character offset.
-        let character: u32 = prefix.chars().map(|c| c.len_utf16() as u32).sum();
-
-        Position {
-            line: line as u32,
-            character,
-        }
-    }
-
-    /// Convert a byte range to an LSP `Range`.
-    pub fn range_of(&self, text: &str, start: usize, end: usize) -> Range {
-        Range {
-            start: self.position_of(text, start),
-            end: self.position_of(text, end),
-        }
-    }
+#[inline]
+fn from_lsp_position(index: &LineIndex, pos: Position) -> line_index::TextSize {
+    let wide = WideLineCol {
+        line: pos.line,
+        col: pos.character,
+    };
+    let line_col = index.to_utf8(WideEncoding::Utf16, wide).unwrap_or(LineCol {
+        line: wide.line,
+        col: wide.col,
+    });
+    index.offset(line_col).unwrap_or(index.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -187,9 +90,8 @@ impl Document {
     /// Order matters: compute old positions from pre-edit text, apply the text
     /// change, compute new positions from post-edit text, then tell tree-sitter.
     pub fn apply_edit(&mut self, range: Range, new_text: &str, version: i32) {
-        let start_byte = self.line_index.offset_of(&self.text, range.start);
-        let old_end_byte = self.line_index.offset_of(&self.text, range.end);
-        let old_len = old_end_byte - start_byte;
+        let start_byte = self.offset_of(range.start);
+        let old_end_byte = self.offset_of(range.end);
         let new_end_byte = start_byte + new_text.len();
 
         // Compute old positions from the current (pre-edit) source.
@@ -219,26 +121,29 @@ impl Document {
             .expect("tree-sitter reparse should always succeed");
 
         self.version = version;
-        self.line_index
-            .update(&self.text, start_byte, old_len, new_text);
+        // Rebuild the line index (SIMD-accelerated, fast enough for incremental edits).
+        self.line_index = LineIndex::new(&self.text);
     }
 
     /// Convenience: convert an LSP Position to a byte offset.
     #[inline]
     pub fn offset_of(&self, pos: Position) -> usize {
-        self.line_index.offset_of(&self.text, pos)
+        from_lsp_position(&self.line_index, pos).into()
     }
 
     /// Convenience: convert a byte offset to an LSP Position.
     #[inline]
     pub fn position_of(&self, offset: usize) -> Position {
-        self.line_index.position_of(&self.text, offset)
+        to_lsp_position(&self.line_index, line_index::TextSize::new(offset as u32))
     }
 
     /// Convenience: convert a byte range to an LSP Range.
     #[inline]
     pub fn range_of(&self, start: usize, end: usize) -> Range {
-        self.line_index.range_of(&self.text, start, end)
+        Range {
+            start: self.position_of(start),
+            end: self.position_of(end),
+        }
     }
 
     /// Source bytes for passing to tree-sitter node methods.

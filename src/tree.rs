@@ -151,6 +151,26 @@ pub fn array_items<'a>(array: Node<'a>, cursor: &mut tree_sitter::TreeCursor<'a>
         .collect()
 }
 
+/// Count the key-value pairs of an `object` node without allocating.
+pub fn object_pair_count(object: Node<'_>) -> usize {
+    debug_assert_eq!(object.kind(), kinds::OBJECT);
+    let mut cursor = object.walk();
+    object
+        .named_children(&mut cursor)
+        .filter(|n| n.kind() == kinds::PAIR)
+        .count()
+}
+
+/// Count the value items of an `array` node without allocating.
+pub fn array_item_count(array: Node<'_>) -> usize {
+    debug_assert_eq!(array.kind(), kinds::ARRAY);
+    let mut cursor = array.walk();
+    array
+        .named_children(&mut cursor)
+        .filter(|n| is_value_node(n))
+        .count()
+}
+
 /// Check if a node represents a JSON value.
 pub fn is_value_node(node: &Node<'_>) -> bool {
     matches!(

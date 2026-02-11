@@ -11,6 +11,7 @@ tokio = { version = "1", features = ["rt", "macros", "io-std", "sync", "time"] }
 # Parsing
 tree-sitter = "0.26"
 tree-sitter-json = "0.24"
+line-index = "0.1"
 
 # Schema
 serde = { version = "1", features = ["derive"] }
