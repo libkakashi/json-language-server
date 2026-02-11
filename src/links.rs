@@ -1,6 +1,8 @@
 /// Document links: detects `$ref` values and URLs in JSON strings.
 /// Also provides go-to-definition for `$ref` within the same document.
-use tower_lsp::lsp_types::*;
+use std::str::FromStr;
+
+use lsp_types::*;
 use tree_sitter::Node;
 
 use crate::document::Document;
@@ -48,7 +50,7 @@ pub fn find_definition(doc: &Document, offset: usize) -> Option<Location> {
     // Placeholder URI — the server's goto_definition handler replaces it
     // with the actual document URI before returning to the client.
     Some(Location {
-        uri: Url::parse("file:///placeholder").unwrap(),
+        uri: Uri::from_str("file:///placeholder").unwrap(),
         range,
     })
 }
@@ -65,7 +67,7 @@ fn collect_links(doc: &Document, node: Node<'_>, links: &mut Vec<DocumentLink>) 
         if key == "$ref" {
             let range = doc.range_of(value_node.start_byte(), value_node.end_byte());
             let target = if val.starts_with("http://") || val.starts_with("https://") {
-                Url::parse(&val).ok()
+                Uri::from_str(&val).ok()
             } else {
                 None
             };
@@ -78,7 +80,7 @@ fn collect_links(doc: &Document, node: Node<'_>, links: &mut Vec<DocumentLink>) 
         }
         // URLs in any string value.
         else if (val.starts_with("http://") || val.starts_with("https://"))
-            && let Ok(url) = Url::parse(&val)
+            && let Ok(url) = Uri::from_str(&val)
         {
             let range = doc.range_of(value_node.start_byte(), value_node.end_byte());
             links.push(DocumentLink {

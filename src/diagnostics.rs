@@ -2,7 +2,7 @@
 /// nodes and detects duplicate keys in objects.
 use std::collections::HashSet;
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+use lsp_types::{Diagnostic, DiagnosticSeverity};
 use tree_sitter::Node;
 
 use crate::document::Document;
@@ -252,7 +252,7 @@ fn node_text<'a>(node: Node<'_>, source: &'a [u8]) -> &'a str {
 mod tests {
     use super::*;
     use crate::document::Document;
-    use tower_lsp::lsp_types::DiagnosticSeverity;
+    use lsp_types::DiagnosticSeverity;
 
     fn errors(src: &str) -> Vec<Diagnostic> {
         let doc = Document::new(src.into(), 0);

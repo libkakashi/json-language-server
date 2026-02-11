@@ -3,7 +3,7 @@
 /// Formatting walks the tree-sitter CST directly, avoiding a redundant
 /// serde_json round-trip. Sorting still uses serde_json since tree-sitter
 /// doesn't provide sorted iteration.
-use tower_lsp::lsp_types::*;
+use lsp_types::*;
 use tree_sitter::Node;
 
 use crate::document::Document;

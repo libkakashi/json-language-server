@@ -1,11 +1,13 @@
-/// LSP server: wires all features together via tower-lsp.
+/// LSP server: wires all features together via lsp-server.
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use tokio::time::{Duration, sleep};
-use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer};
+use crossbeam_channel::Sender;
+use lsp_server::{Connection, ExtractError, Message, Notification, Request, RequestId, Response};
+use lsp_types::notification::{self, Notification as _};
+use lsp_types::request::{self, Request as _};
+use lsp_types::*;
 use tracing::{debug, info, warn};
 
 use crate::colors;
@@ -20,7 +22,6 @@ use crate::schema::resolver::{self, SchemaAssociation, SchemaLookup, SchemaStore
 use crate::schema::types::JsonSchema;
 use crate::schema::validation::{self, RegexCache};
 use crate::selection;
-use crate::symbols;
 use crate::tree;
 
 pub struct ServerState {
@@ -31,39 +32,265 @@ pub struct ServerState {
 /// Debounce delay for validation after edits.
 const DEBOUNCE_MS: u64 = 75;
 
-pub struct JsonLanguageServer {
-    pub client: Client,
-    pub state: Mutex<ServerState>,
-    /// Server-wide regex cache, separate from state to avoid borrow conflicts.
+/// Shared state that background threads (debounced validation) can access.
+struct Shared {
+    state: Mutex<ServerState>,
     regex_cache: Mutex<RegexCache>,
-    /// Monotonic counter per URI for debouncing validation.
-    /// Each edit bumps the counter; validation only proceeds if
-    /// the counter hasn't changed after the debounce delay.
-    debounce_versions: Mutex<HashMap<Url, u64>>,
+    debounce_versions: Mutex<HashMap<Uri, u64>>,
+}
+
+pub struct JsonLanguageServer {
+    connection: Connection,
+    shared: Arc<Shared>,
 }
 
 impl JsonLanguageServer {
-    pub fn new(client: Client) -> Self {
+    pub fn new(connection: Connection) -> Self {
         JsonLanguageServer {
-            client,
-            state: Mutex::new(ServerState {
-                documents: DocumentStore::new(),
-                schemas: SchemaStore::new(),
+            connection,
+            shared: Arc::new(Shared {
+                state: Mutex::new(ServerState {
+                    documents: DocumentStore::new(),
+                    schemas: SchemaStore::new(),
+                }),
+                regex_cache: Mutex::new(RegexCache::new()),
+                debounce_versions: Mutex::new(HashMap::new()),
             }),
-            regex_cache: Mutex::new(RegexCache::new()),
-            debounce_versions: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Run the server: initialize, then enter the main loop.
+    pub fn run(&self) {
+        let caps = self.server_capabilities();
+        let init_result = InitializeResult {
+            server_info: Some(ServerInfo {
+                name: "json-language-server".into(),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+            }),
+            capabilities: caps,
+        };
+        let init_json = serde_json::to_value(init_result).unwrap();
+        let (id, _params) = self.connection.initialize_start().unwrap();
+
+        // Send the initialize response ourselves instead of using
+        // initialize_finish(), which blocks until it receives `initialized`.
+        // Some clients (and benchmarks) may send `shutdown` before
+        // `initialized`, so we handle `initialized` in the main loop instead.
+        let resp = Response::new_ok(id, init_json);
+        self.connection
+            .sender
+            .send(Message::Response(resp))
+            .unwrap();
+
+        info!("json-language-server initialized");
+        self.send_notification::<notification::LogMessage>(LogMessageParams {
+            typ: MessageType::INFO,
+            message: "JSON Language Server ready".into(),
+        });
+
+        self.main_loop();
+        info!("json-language-server shutting down");
+    }
+
+    fn server_capabilities(&self) -> ServerCapabilities {
+        ServerCapabilities {
+            text_document_sync: Some(TextDocumentSyncCapability::Options(
+                TextDocumentSyncOptions {
+                    open_close: Some(true),
+                    change: Some(TextDocumentSyncKind::INCREMENTAL),
+                    will_save: None,
+                    will_save_wait_until: None,
+                    save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                        include_text: Some(false),
+                    })),
+                },
+            )),
+            hover_provider: Some(HoverProviderCapability::Simple(true)),
+            completion_provider: Some(CompletionOptions {
+                resolve_provider: Some(false),
+                trigger_characters: Some(vec!["\"".into(), ":".into(), " ".into()]),
+                all_commit_characters: None,
+                work_done_progress_options: Default::default(),
+                ..Default::default()
+            }),
+            document_symbol_provider: Some(OneOf::Left(true)),
+            document_formatting_provider: Some(OneOf::Left(true)),
+            document_range_formatting_provider: Some(OneOf::Left(true)),
+            color_provider: Some(ColorProviderCapability::Simple(true)),
+            folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+            selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+            document_link_provider: Some(DocumentLinkOptions {
+                resolve_provider: Some(false),
+                work_done_progress_options: Default::default(),
+            }),
+            definition_provider: Some(OneOf::Left(true)),
+            execute_command_provider: Some(ExecuteCommandOptions {
+                commands: vec!["json.sort".into()],
+                work_done_progress_options: Default::default(),
+            }),
+            ..ServerCapabilities::default()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Main loop
+    // -----------------------------------------------------------------------
+
+    fn main_loop(&self) {
+        for msg in &self.connection.receiver {
+            match msg {
+                Message::Request(req) => {
+                    if self.connection.handle_shutdown(&req).unwrap_or(true) {
+                        return;
+                    }
+                    self.dispatch_request(req);
+                }
+                Message::Notification(not) => {
+                    self.dispatch_notification(not);
+                }
+                Message::Response(_resp) => {
+                    // Responses to our outgoing requests (e.g. workspace/applyEdit).
+                }
+                Message::PreSerialized(_) => {
+                    // PreSerialized messages are outgoing only; never received.
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Request dispatch
+    // -----------------------------------------------------------------------
+
+    fn dispatch_request(&self, req: Request) {
+        fn cast<R: request::Request>(
+            req: Request,
+        ) -> Result<(RequestId, R::Params), ExtractError<Request>> {
+            req.extract(R::METHOD)
+        }
+
+        let req = match cast::<request::HoverRequest>(req) {
+            Ok((id, params)) => return self.on_hover(id, params),
+            Err(ExtractError::MethodMismatch(req)) => req,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        let req = match cast::<request::Completion>(req) {
+            Ok((id, params)) => return self.on_completion(id, params),
+            Err(ExtractError::MethodMismatch(req)) => req,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        let req = match cast::<request::DocumentSymbolRequest>(req) {
+            Ok((id, params)) => return self.on_document_symbol(id, params),
+            Err(ExtractError::MethodMismatch(req)) => req,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        let req = match cast::<request::Formatting>(req) {
+            Ok((id, params)) => return self.on_formatting(id, params),
+            Err(ExtractError::MethodMismatch(req)) => req,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        let req = match cast::<request::RangeFormatting>(req) {
+            Ok((id, params)) => return self.on_range_formatting(id, params),
+            Err(ExtractError::MethodMismatch(req)) => req,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        let req = match cast::<request::DocumentColor>(req) {
+            Ok((id, params)) => return self.on_document_color(id, params),
+            Err(ExtractError::MethodMismatch(req)) => req,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        let req = match cast::<request::ColorPresentationRequest>(req) {
+            Ok((id, params)) => return self.on_color_presentation(id, params),
+            Err(ExtractError::MethodMismatch(req)) => req,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        let req = match cast::<request::FoldingRangeRequest>(req) {
+            Ok((id, params)) => return self.on_folding_range(id, params),
+            Err(ExtractError::MethodMismatch(req)) => req,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        let req = match cast::<request::SelectionRangeRequest>(req) {
+            Ok((id, params)) => return self.on_selection_range(id, params),
+            Err(ExtractError::MethodMismatch(req)) => req,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        let req = match cast::<request::DocumentLinkRequest>(req) {
+            Ok((id, params)) => return self.on_document_link(id, params),
+            Err(ExtractError::MethodMismatch(req)) => req,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        let req = match cast::<request::GotoDefinition>(req) {
+            Ok((id, params)) => return self.on_goto_definition(id, params),
+            Err(ExtractError::MethodMismatch(req)) => req,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        match cast::<request::ExecuteCommand>(req) {
+            Ok((id, params)) => return self.on_execute_command(id, params),
+            Err(ExtractError::MethodMismatch(_req)) => {}
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // Notification dispatch
+    // -----------------------------------------------------------------------
+
+    fn dispatch_notification(&self, not: Notification) {
+        fn cast<N: notification::Notification>(
+            not: Notification,
+        ) -> Result<N::Params, ExtractError<Notification>> {
+            not.extract(N::METHOD)
+        }
+
+        let not = match cast::<notification::DidOpenTextDocument>(not) {
+            Ok(params) => return self.on_did_open(params),
+            Err(ExtractError::MethodMismatch(not)) => not,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        let not = match cast::<notification::DidChangeTextDocument>(not) {
+            Ok(params) => return self.on_did_change(params),
+            Err(ExtractError::MethodMismatch(not)) => not,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        let not = match cast::<notification::DidSaveTextDocument>(not) {
+            Ok(params) => return self.on_did_save(params),
+            Err(ExtractError::MethodMismatch(not)) => not,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        let not = match cast::<notification::DidCloseTextDocument>(not) {
+            Ok(params) => return self.on_did_close(params),
+            Err(ExtractError::MethodMismatch(not)) => not,
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+        match cast::<notification::DidChangeConfiguration>(not) {
+            Ok(params) => return self.on_did_change_configuration(params),
+            Err(ExtractError::MethodMismatch(_not)) => {}
+            Err(ExtractError::JsonError { .. }) => return,
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    fn send_response<T: serde::Serialize>(&self, id: RequestId, result: T) {
+        let resp = Response::new_ok(id, result);
+        self.connection.sender.send(Message::Response(resp)).ok();
+    }
+
+    fn send_notification<N: notification::Notification>(&self, params: N::Params) {
+        let not = Notification::new(N::METHOD.into(), params);
+        self.connection.sender.send(Message::Notification(not)).ok();
+    }
+
     /// Resolve a schema for a document, fetching over HTTP if needed.
-    /// Handles lock/unlock around the blocking fetch.
-    async fn resolve_schema(
+    fn resolve_schema(
         &self,
         doc_uri: &str,
         inline_schema_uri: Option<&str>,
     ) -> Option<Arc<JsonSchema>> {
         let lookup = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.shared.state.lock().unwrap();
             state
                 .schemas
                 .schema_for_document(doc_uri, inline_schema_uri)
@@ -72,14 +299,11 @@ impl JsonLanguageServer {
         match lookup {
             SchemaLookup::Resolved(schema) => Some(schema),
             SchemaLookup::NeedsFetch(uri) => {
-                let agent = self.state.lock().unwrap().schemas.http_agent();
-                let fetch_uri = uri.clone();
-                let raw =
-                    tokio::task::spawn_blocking(move || resolver::fetch_schema(&agent, &fetch_uri))
-                        .await
-                        .ok()??;
+                let agent = self.shared.state.lock().unwrap().schemas.http_agent();
+                let raw = resolver::fetch_schema(&agent, &uri)?;
                 let schema = JsonSchema::from_value(&raw);
-                self.state
+                self.shared
+                    .state
                     .lock()
                     .unwrap()
                     .schemas
@@ -90,168 +314,67 @@ impl JsonLanguageServer {
         }
     }
 
-    /// Schedule a debounced validation. Bumps the version counter and waits;
-    /// if another edit arrives during the delay, this call becomes a no-op.
-    async fn debounced_validate(&self, uri: &Url) {
+    /// Schedule a debounced validation on a background thread.
+    fn debounced_validate(&self, uri: Uri) {
         let version = {
-            let mut versions = self.debounce_versions.lock().unwrap();
+            let mut versions = self.shared.debounce_versions.lock().unwrap();
             let v = versions.entry(uri.clone()).or_insert(0);
             *v += 1;
             *v
         };
 
-        sleep(Duration::from_millis(DEBOUNCE_MS)).await;
+        let sender = self.connection.sender.clone();
+        let shared = Arc::clone(&self.shared);
 
-        let current = {
-            let versions = self.debounce_versions.lock().unwrap();
-            versions.get(uri).copied().unwrap_or(0)
-        };
-        if current != version {
-            return; // A newer edit superseded this one.
-        }
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(DEBOUNCE_MS));
 
-        self.validate_and_publish(uri).await;
-    }
-
-    /// Run syntax + schema validation and push diagnostics to the client.
-    async fn validate_and_publish(&self, uri: &Url) {
-        let (mut diags, version, needs_schema, uri_str, inline_schema) = {
-            let state = self.state.lock().unwrap();
-
-            let doc = match state.documents.get(uri) {
-                Some(d) => d,
-                None => return,
+            // Check if a newer edit superseded this one.
+            let current = {
+                let versions = shared.debounce_versions.lock().unwrap();
+                versions.get(&uri).copied().unwrap_or(0)
             };
-
-            let diags = diagnostics::syntax_diagnostics(doc);
-            let version = Some(doc.version);
-            let needs_schema = diags.is_empty() && tree::root_value(&doc.tree).is_some();
-            let uri_str = uri.as_str().to_string();
-            let inline_schema = if needs_schema {
-                crate::schema::resolver::extract_schema_property(doc)
-            } else {
-                None
-            };
-
-            (diags, version, needs_schema, uri_str, inline_schema)
-        };
-
-        if needs_schema {
-            let schema = self
-                .resolve_schema(&uri_str, inline_schema.as_deref())
-                .await;
-
-            let state = self.state.lock().unwrap();
-            let mut regex_cache = self.regex_cache.lock().unwrap();
-            if let (Some(schema), Some(doc)) = (schema, state.documents.get(uri))
-                && let Some(root) = tree::root_value(&doc.tree)
-            {
-                let val_errors =
-                    validation::validate(root, doc.source(), &schema, &mut regex_cache);
-                for ve in &val_errors {
-                    diags.push(Diagnostic {
-                        range: doc.range_of(ve.start_byte, ve.end_byte),
-                        severity: Some(match ve.severity {
-                            validation::Severity::Error => DiagnosticSeverity::ERROR,
-                            validation::Severity::Warning => DiagnosticSeverity::WARNING,
-                        }),
-                        source: Some("json".into()),
-                        message: ve.message.clone(),
-                        ..Diagnostic::default()
-                    });
-                }
+            if current != version {
+                return;
             }
-        }
 
-        self.client
-            .publish_diagnostics(uri.clone(), diags, version)
-            .await;
-    }
-}
-
-#[tower_lsp::async_trait]
-impl LanguageServer for JsonLanguageServer {
-    async fn initialize(&self, _params: InitializeParams) -> Result<InitializeResult> {
-        info!("json-language-server initializing");
-
-        Ok(InitializeResult {
-            server_info: Some(ServerInfo {
-                name: "json-language-server".into(),
-                version: Some(env!("CARGO_PKG_VERSION").into()),
-            }),
-            capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Options(
-                    TextDocumentSyncOptions {
-                        open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::INCREMENTAL),
-                        will_save: None,
-                        will_save_wait_until: None,
-                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
-                            include_text: Some(false),
-                        })),
-                    },
-                )),
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
-                completion_provider: Some(CompletionOptions {
-                    resolve_provider: Some(false),
-                    trigger_characters: Some(vec!["\"".into(), ":".into(), " ".into()]),
-                    all_commit_characters: None,
-                    work_done_progress_options: Default::default(),
-                    ..Default::default()
-                }),
-                document_symbol_provider: Some(OneOf::Left(true)),
-                document_formatting_provider: Some(OneOf::Left(true)),
-                document_range_formatting_provider: Some(OneOf::Left(true)),
-                color_provider: Some(ColorProviderCapability::Simple(true)),
-                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
-                selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
-                document_link_provider: Some(DocumentLinkOptions {
-                    resolve_provider: Some(false),
-                    work_done_progress_options: Default::default(),
-                }),
-                definition_provider: Some(OneOf::Left(true)),
-                execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec!["json.sort".into()],
-                    work_done_progress_options: Default::default(),
-                }),
-                ..ServerCapabilities::default()
-            },
-        })
+            validate_and_publish(&uri, &shared.state, &shared.regex_cache, &sender);
+        });
     }
 
-    async fn initialized(&self, _params: InitializedParams) {
-        info!("json-language-server initialized");
-        self.client
-            .log_message(MessageType::INFO, "JSON Language Server ready")
-            .await;
+    /// Run validation immediately and publish diagnostics.
+    fn validate_and_publish(&self, uri: &Uri) {
+        validate_and_publish(
+            uri,
+            &self.shared.state,
+            &self.shared.regex_cache,
+            &self.connection.sender,
+        );
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        info!("json-language-server shutting down");
-        Ok(())
-    }
+    // -----------------------------------------------------------------------
+    // Document sync
+    // -----------------------------------------------------------------------
 
-    // -- Document sync --
-
-    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+    fn on_did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
-        debug!("did_open: {}", uri);
+        debug!("did_open: {}", uri.as_str());
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.shared.state.lock().unwrap();
             state.documents.open(
-                params.text_document.uri.clone(),
+                params.text_document.uri,
                 params.text_document.text,
                 params.text_document.version,
             );
         }
-        self.validate_and_publish(&uri).await;
+        self.validate_and_publish(&uri);
     }
 
-    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+    fn on_did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
-        debug!("did_change: {}", uri);
+        debug!("did_change: {}", uri.as_str());
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.shared.state.lock().unwrap();
             if let Some(doc) = state.documents.get_mut(&uri) {
                 for change in params.content_changes {
                     match change.range {
@@ -265,28 +388,32 @@ impl LanguageServer for JsonLanguageServer {
                 }
             }
         }
-        self.debounced_validate(&uri).await;
+        self.debounced_validate(uri);
     }
 
-    async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        debug!("did_save: {}", params.text_document.uri);
-        self.validate_and_publish(&params.text_document.uri).await;
+    fn on_did_save(&self, params: DidSaveTextDocumentParams) {
+        debug!("did_save: {}", params.text_document.uri.as_str());
+        self.validate_and_publish(&params.text_document.uri);
     }
 
-    async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        debug!("did_close: {}", params.text_document.uri);
+    fn on_did_close(&self, params: DidCloseTextDocumentParams) {
+        debug!("did_close: {}", params.text_document.uri.as_str());
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.shared.state.lock().unwrap();
             state.documents.close(&params.text_document.uri);
         }
-        self.client
-            .publish_diagnostics(params.text_document.uri, Vec::new(), None)
-            .await;
+        self.send_notification::<notification::PublishDiagnostics>(PublishDiagnosticsParams {
+            uri: params.text_document.uri,
+            diagnostics: Vec::new(),
+            version: None,
+        });
     }
 
-    // -- Configuration --
+    // -----------------------------------------------------------------------
+    // Configuration
+    // -----------------------------------------------------------------------
 
-    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+    fn on_did_change_configuration(&self, params: DidChangeConfigurationParams) {
         debug!("did_change_configuration");
         if let Some(schemas) = params
             .settings
@@ -319,22 +446,24 @@ impl LanguageServer for JsonLanguageServer {
                 })
                 .collect();
 
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.shared.state.lock().unwrap();
             state.schemas.set_associations(associations);
         }
     }
 
-    // -- Hover --
+    // -----------------------------------------------------------------------
+    // Hover
+    // -----------------------------------------------------------------------
 
-    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+    fn on_hover(&self, id: RequestId, params: HoverParams) {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
 
         let (offset, inline_schema) = {
-            let state = self.state.lock().unwrap();
+            let state = self.shared.state.lock().unwrap();
             let doc = match state.documents.get(uri) {
                 Some(d) => d,
-                None => return Ok(None),
+                None => return self.send_response(id, Option::<Hover>::None),
             };
             let offset = doc.offset_of(pos);
             let inline = crate::schema::resolver::extract_schema_property(doc);
@@ -342,30 +471,31 @@ impl LanguageServer for JsonLanguageServer {
         };
 
         let uri_str = uri.as_str().to_string();
-        let schema = self
-            .resolve_schema(&uri_str, inline_schema.as_deref())
-            .await;
+        let schema = self.resolve_schema(&uri_str, inline_schema.as_deref());
 
-        let state = self.state.lock().unwrap();
+        let state = self.shared.state.lock().unwrap();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
-            None => return Ok(None),
+            None => return self.send_response(id, Option::<Hover>::None),
         };
 
-        Ok(hover::hover(doc, offset, schema.as_ref()))
+        let result = hover::hover(doc, offset, schema.as_ref());
+        self.send_response(id, result);
     }
 
-    // -- Completion --
+    // -----------------------------------------------------------------------
+    // Completion
+    // -----------------------------------------------------------------------
 
-    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+    fn on_completion(&self, id: RequestId, params: CompletionParams) {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
 
         let (offset, inline_schema) = {
-            let state = self.state.lock().unwrap();
+            let state = self.shared.state.lock().unwrap();
             let doc = match state.documents.get(uri) {
                 Some(d) => d,
-                None => return Ok(None),
+                None => return self.send_response(id, Option::<CompletionResponse>::None),
             };
             let offset = doc.offset_of(pos);
             let inline = crate::schema::resolver::extract_schema_property(doc);
@@ -373,167 +503,169 @@ impl LanguageServer for JsonLanguageServer {
         };
 
         let uri_str = uri.as_str().to_string();
-        let schema = self
-            .resolve_schema(&uri_str, inline_schema.as_deref())
-            .await;
+        let schema = self.resolve_schema(&uri_str, inline_schema.as_deref());
 
-        let state = self.state.lock().unwrap();
+        let state = self.shared.state.lock().unwrap();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
-            None => return Ok(None),
+            None => return self.send_response(id, Option::<CompletionResponse>::None),
         };
 
         let items = completion::completions(doc, offset, schema.as_ref());
-        if items.is_empty() {
-            Ok(None)
+        let result = if items.is_empty() {
+            None
         } else {
-            Ok(Some(CompletionResponse::Array(items)))
-        }
+            Some(CompletionResponse::Array(items))
+        };
+        self.send_response(id, result);
     }
 
-    // -- Document symbols --
+    // -----------------------------------------------------------------------
+    // Document symbols
+    // -----------------------------------------------------------------------
 
-    async fn document_symbol(
-        &self,
-        params: DocumentSymbolParams,
-    ) -> Result<Option<DocumentSymbolResponse>> {
+    fn on_document_symbol(&self, id: RequestId, params: DocumentSymbolParams) {
         let uri = &params.text_document.uri;
-        let state = self.state.lock().unwrap();
+        let symbols = {
+            let state = self.shared.state.lock().unwrap();
+            match state.documents.get(uri) {
+                Some(d) => d.symbols(),
+                None => return self.send_response(id, Option::<DocumentSymbolResponse>::None),
+            }
+        };
+        let msg = Response::preserialized_ok(id, &symbols);
+        self.connection.sender.send(msg).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Formatting
+    // -----------------------------------------------------------------------
+
+    fn on_formatting(&self, id: RequestId, params: DocumentFormattingParams) {
+        let uri = &params.text_document.uri;
+        let state = self.shared.state.lock().unwrap();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
-            None => return Ok(None),
+            None => return self.send_response(id, Option::<Vec<TextEdit>>::None),
         };
-        Ok(Some(DocumentSymbolResponse::Nested(
-            symbols::document_symbols(doc),
-        )))
+        let result = formatting::format_document(doc, &params.options);
+        self.send_response(id, Some(result));
     }
 
-    // -- Formatting --
-
-    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+    fn on_range_formatting(&self, id: RequestId, params: DocumentRangeFormattingParams) {
         let uri = &params.text_document.uri;
-        let state = self.state.lock().unwrap();
+        let state = self.shared.state.lock().unwrap();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
-            None => return Ok(None),
+            None => return self.send_response(id, Option::<Vec<TextEdit>>::None),
         };
-        Ok(Some(formatting::format_document(doc, &params.options)))
+        let result = formatting::format_range(doc, params.range, &params.options);
+        self.send_response(id, Some(result));
     }
 
-    async fn range_formatting(
-        &self,
-        params: DocumentRangeFormattingParams,
-    ) -> Result<Option<Vec<TextEdit>>> {
+    // -----------------------------------------------------------------------
+    // Colors
+    // -----------------------------------------------------------------------
+
+    fn on_document_color(&self, id: RequestId, params: DocumentColorParams) {
         let uri = &params.text_document.uri;
-        let state = self.state.lock().unwrap();
+        let state = self.shared.state.lock().unwrap();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
-            None => return Ok(None),
+            None => return self.send_response(id, Vec::<ColorInformation>::new()),
         };
-        Ok(Some(formatting::format_range(
-            doc,
-            params.range,
-            &params.options,
-        )))
+        let result = colors::document_colors(doc);
+        self.send_response(id, result);
     }
 
-    // -- Colors --
+    fn on_color_presentation(&self, id: RequestId, params: ColorPresentationParams) {
+        let result = colors::color_presentations(params.color);
+        self.send_response(id, result);
+    }
 
-    async fn document_color(&self, params: DocumentColorParams) -> Result<Vec<ColorInformation>> {
+    // -----------------------------------------------------------------------
+    // Folding
+    // -----------------------------------------------------------------------
+
+    fn on_folding_range(&self, id: RequestId, params: FoldingRangeParams) {
         let uri = &params.text_document.uri;
-        let state = self.state.lock().unwrap();
+        let state = self.shared.state.lock().unwrap();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
-            None => return Ok(Vec::new()),
+            None => return self.send_response(id, Option::<Vec<FoldingRange>>::None),
         };
-        Ok(colors::document_colors(doc))
+        let result = folding::folding_ranges(doc);
+        self.send_response(id, Some(result));
     }
 
-    async fn color_presentation(
-        &self,
-        params: ColorPresentationParams,
-    ) -> Result<Vec<ColorPresentation>> {
-        Ok(colors::color_presentations(params.color))
-    }
+    // -----------------------------------------------------------------------
+    // Selection ranges
+    // -----------------------------------------------------------------------
 
-    // -- Folding --
-
-    async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
+    fn on_selection_range(&self, id: RequestId, params: SelectionRangeParams) {
         let uri = &params.text_document.uri;
-        let state = self.state.lock().unwrap();
+        let state = self.shared.state.lock().unwrap();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
-            None => return Ok(None),
+            None => return self.send_response(id, Option::<Vec<SelectionRange>>::None),
         };
-        Ok(Some(folding::folding_ranges(doc)))
+        let result = selection::selection_ranges(doc, &params.positions);
+        self.send_response(id, Some(result));
     }
 
-    // -- Selection ranges --
+    // -----------------------------------------------------------------------
+    // Document links
+    // -----------------------------------------------------------------------
 
-    async fn selection_range(
-        &self,
-        params: SelectionRangeParams,
-    ) -> Result<Option<Vec<SelectionRange>>> {
+    fn on_document_link(&self, id: RequestId, params: DocumentLinkParams) {
         let uri = &params.text_document.uri;
-        let state = self.state.lock().unwrap();
+        let state = self.shared.state.lock().unwrap();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
-            None => return Ok(None),
+            None => return self.send_response(id, Option::<Vec<DocumentLink>>::None),
         };
-        Ok(Some(selection::selection_ranges(doc, &params.positions)))
+        let result = links::document_links(doc);
+        self.send_response(id, Some(result));
     }
 
-    // -- Document links --
+    // -----------------------------------------------------------------------
+    // Go to definition
+    // -----------------------------------------------------------------------
 
-    async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
-        let uri = &params.text_document.uri;
-        let state = self.state.lock().unwrap();
-        let doc = match state.documents.get(uri) {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-        Ok(Some(links::document_links(doc)))
-    }
-
-    // -- Go to definition --
-
-    async fn goto_definition(
-        &self,
-        params: GotoDefinitionParams,
-    ) -> Result<Option<GotoDefinitionResponse>> {
+    fn on_goto_definition(&self, id: RequestId, params: GotoDefinitionParams) {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
 
-        let state = self.state.lock().unwrap();
+        let state = self.shared.state.lock().unwrap();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
-            None => return Ok(None),
+            None => return self.send_response(id, Option::<GotoDefinitionResponse>::None),
         };
 
         let offset = doc.offset_of(pos);
-        match links::find_definition(doc, offset) {
+        let result = match links::find_definition(doc, offset) {
             Some(mut loc) => {
                 loc.uri = uri.clone();
-                Ok(Some(GotoDefinitionResponse::Scalar(loc)))
+                Some(GotoDefinitionResponse::Scalar(loc))
             }
-            None => Ok(None),
-        }
+            None => None,
+        };
+        self.send_response(id, result);
     }
 
-    // -- Execute command (sort) --
+    // -----------------------------------------------------------------------
+    // Execute command (sort)
+    // -----------------------------------------------------------------------
 
-    async fn execute_command(
-        &self,
-        params: ExecuteCommandParams,
-    ) -> Result<Option<serde_json::Value>> {
+    fn on_execute_command(&self, id: RequestId, params: ExecuteCommandParams) {
         match params.command.as_str() {
             "json.sort" => {
                 let edit = {
                     if let Some(uri_val) = params.arguments.first()
                         && let Some(uri_str) = uri_val.as_str()
-                        && let Ok(uri) = Url::parse(uri_str)
+                        && let Ok(uri) = Uri::from_str(uri_str)
                     {
-                        let state = self.state.lock().unwrap();
+                        let state = self.shared.state.lock().unwrap();
                         if let Some(doc) = state.documents.get(&uri) {
                             let edits = formatting::sort_document(doc);
                             if !edits.is_empty() {
@@ -554,14 +686,116 @@ impl LanguageServer for JsonLanguageServer {
                     }
                 };
                 if let Some(edit) = edit {
-                    let _ = self.client.apply_edit(edit).await;
+                    // Send workspace/applyEdit request (fire-and-forget).
+                    let params = ApplyWorkspaceEditParams {
+                        label: Some("Sort JSON".into()),
+                        edit,
+                    };
+                    let req = Request::new(
+                        RequestId::from("apply-edit".to_string()),
+                        request::ApplyWorkspaceEdit::METHOD.into(),
+                        serde_json::to_value(params).unwrap(),
+                    );
+                    self.connection.sender.send(Message::Request(req)).ok();
                 }
-                Ok(None)
+                self.send_response(id, Option::<serde_json::Value>::None);
             }
             _ => {
                 warn!("unknown command: {}", params.command);
-                Ok(None)
+                self.send_response(id, Option::<serde_json::Value>::None);
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Free function for validation (callable from background threads)
+// ---------------------------------------------------------------------------
+
+fn validate_and_publish(
+    uri: &Uri,
+    state: &Mutex<ServerState>,
+    regex_cache: &Mutex<RegexCache>,
+    sender: &Sender<Message>,
+) {
+    let (mut diags, version, needs_schema, uri_str, inline_schema) = {
+        let state = state.lock().unwrap();
+
+        let doc = match state.documents.get(uri) {
+            Some(d) => d,
+            None => return,
+        };
+
+        let diags = diagnostics::syntax_diagnostics(doc);
+        let version = Some(doc.version);
+        let needs_schema = diags.is_empty() && tree::root_value(&doc.tree).is_some();
+        let uri_str = uri.as_str().to_string();
+        let inline_schema = if needs_schema {
+            crate::schema::resolver::extract_schema_property(doc)
+        } else {
+            None
+        };
+
+        (diags, version, needs_schema, uri_str, inline_schema)
+    };
+
+    if needs_schema {
+        let schema = {
+            let lookup = {
+                let mut state = state.lock().unwrap();
+                state
+                    .schemas
+                    .schema_for_document(&uri_str, inline_schema.as_deref())
+            };
+
+            match lookup {
+                SchemaLookup::Resolved(schema) => Some(schema),
+                SchemaLookup::NeedsFetch(fetch_uri) => {
+                    let agent = state.lock().unwrap().schemas.http_agent();
+                    let raw = resolver::fetch_schema(&agent, &fetch_uri);
+                    raw.map(|r| {
+                        let schema = JsonSchema::from_value(&r);
+                        state
+                            .lock()
+                            .unwrap()
+                            .schemas
+                            .insert_cache(fetch_uri, schema.clone());
+                        schema
+                    })
+                }
+                SchemaLookup::None => None,
+            }
+        };
+
+        let state = state.lock().unwrap();
+        let mut regex_cache = regex_cache.lock().unwrap();
+        if let (Some(schema), Some(doc)) = (schema, state.documents.get(uri))
+            && let Some(root) = tree::root_value(&doc.tree)
+        {
+            let val_errors = validation::validate(root, doc.source(), &schema, &mut regex_cache);
+            for ve in &val_errors {
+                diags.push(lsp_types::Diagnostic {
+                    range: doc.range_of(ve.start_byte, ve.end_byte),
+                    severity: Some(match ve.severity {
+                        validation::Severity::Error => DiagnosticSeverity::ERROR,
+                        validation::Severity::Warning => DiagnosticSeverity::WARNING,
+                    }),
+                    source: Some("json".into()),
+                    message: ve.message.clone(),
+                    ..lsp_types::Diagnostic::default()
+                });
+            }
+        }
+    }
+
+    let params = PublishDiagnosticsParams {
+        uri: uri.clone(),
+        diagnostics: diags,
+        version,
+    };
+    let not = Notification::new(
+        notification::PublishDiagnostics::METHOD.into(),
+        serde_json::to_value(params).unwrap(),
+    );
+    sender.send(Message::Notification(not)).ok();
 }

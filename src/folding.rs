@@ -1,5 +1,5 @@
 /// Folding range provider: every object, array, and comment block is foldable.
-use tower_lsp::lsp_types::*;
+use lsp_types::*;
 use tree_sitter::Node;
 
 use crate::document::Document;

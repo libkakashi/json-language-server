@@ -1,6 +1,6 @@
 /// Document colors: detects CSS hex color values in JSON strings
 /// and provides color presentation conversions.
-use tower_lsp::lsp_types::*;
+use lsp_types::*;
 use tree_sitter::Node;
 
 use crate::document::Document;
@@ -54,10 +54,11 @@ fn make_presentation(label: String) -> ColorPresentation {
 fn collect_colors(doc: &Document, node: Node<'_>, colors: &mut Vec<ColorInformation>) {
     if node.kind() == kinds::STRING {
         if let Some(raw) = tree::string_content(node, doc.source())
-            && let Some(color) = parse_hex_color(raw) {
-                let range = doc.range_of(node.start_byte(), node.end_byte());
-                colors.push(ColorInformation { range, color });
-            }
+            && let Some(color) = parse_hex_color(raw)
+        {
+            let range = doc.range_of(node.start_byte(), node.end_byte());
+            colors.push(ColorInformation { range, color });
+        }
         return; // No children to recurse into.
     }
 

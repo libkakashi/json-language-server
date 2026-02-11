@@ -1,6 +1,6 @@
 /// Selection range provider: walk up the tree-sitter node hierarchy.
 /// Each parent becomes a wider selection range.
-use tower_lsp::lsp_types::*;
+use lsp_types::*;
 
 use crate::document::Document;
 use crate::tree;

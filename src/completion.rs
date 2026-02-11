@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tower_lsp::lsp_types::*;
+use lsp_types::*;
 use tree_sitter::Node;
 
 use crate::document::Document;

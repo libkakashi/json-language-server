@@ -1,11 +1,10 @@
-use tower_lsp::{LspService, Server};
+use lsp_server::Connection;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use json_language_server::server::JsonLanguageServer;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
     // Initialize logging.  Set RUST_LOG=debug for verbose output.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -20,10 +19,11 @@ async fn main() {
         env!("CARGO_PKG_VERSION")
     );
 
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
+    let (connection, io_threads) = Connection::stdio();
 
-    let (service, socket) = LspService::new(JsonLanguageServer::new);
+    let server = JsonLanguageServer::new(connection);
+    server.run();
+    drop(server);
 
-    Server::new(stdin, stdout, socket).serve(service).await;
+    io_threads.join().unwrap();
 }

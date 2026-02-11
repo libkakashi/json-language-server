@@ -5,13 +5,15 @@ edition = "2024"
 
 [dependencies]
 # LSP
-tower-lsp = "0.20"
-tokio = { version = "1", features = ["rt", "macros", "io-std", "sync", "time"] }
+lsp-server = "0.7"
+lsp-types = "0.97"
+crossbeam-channel = "0.5"
 
 # Parsing
 tree-sitter = "0.26"
 tree-sitter-json = "0.24"
 line-index = "0.1"
+itoa = "1"
 
 # Schema
 serde = { version = "1", features = ["derive"] }
@@ -25,6 +27,9 @@ lru = "0.12"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+lsp-server = { path = "lsp-server" }
 
 [profile.release]
 opt-level = 3

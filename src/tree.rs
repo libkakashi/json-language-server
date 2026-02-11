@@ -29,6 +29,72 @@ pub mod kinds {
 }
 
 // ---------------------------------------------------------------------------
+// Cached numeric IDs (resolved once from grammar)
+// ---------------------------------------------------------------------------
+
+/// Pre-cached node kind IDs for fast comparison via `node.kind_id()`.
+/// Avoids the FFI string conversion that `node.kind()` performs.
+pub struct KindIds {
+    pub object: u16,
+    pub array: u16,
+    pub pair: u16,
+    pub string: u16,
+    pub number: u16,
+    pub r#true: u16,
+    pub r#false: u16,
+    pub null: u16,
+}
+
+impl KindIds {
+    fn new(lang: &tree_sitter::Language) -> Self {
+        KindIds {
+            object: lang.id_for_node_kind("object", true),
+            array: lang.id_for_node_kind("array", true),
+            pair: lang.id_for_node_kind("pair", true),
+            string: lang.id_for_node_kind("string", true),
+            number: lang.id_for_node_kind("number", true),
+            r#true: lang.id_for_node_kind("true", true),
+            r#false: lang.id_for_node_kind("false", true),
+            null: lang.id_for_node_kind("null", true),
+        }
+    }
+}
+
+/// Pre-cached field IDs for fast child lookup via `node.child_by_field_id()`.
+/// Avoids the C-side string hash that `child_by_field_name()` performs.
+pub struct FieldIds {
+    pub key: u16,
+    pub value: u16,
+}
+
+impl FieldIds {
+    fn new(lang: &tree_sitter::Language) -> Self {
+        FieldIds {
+            key: lang
+                .field_id_for_name("key")
+                .map(|id| id.get())
+                .unwrap_or(0),
+            value: lang
+                .field_id_for_name("value")
+                .map(|id| id.get())
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Check if a node kind ID represents a JSON value.
+#[inline]
+pub fn is_value_node_id(kind_id: u16, kinds: &KindIds) -> bool {
+    kind_id == kinds.object
+        || kind_id == kinds.array
+        || kind_id == kinds.string
+        || kind_id == kinds.number
+        || kind_id == kinds.r#true
+        || kind_id == kinds.r#false
+        || kind_id == kinds.null
+}
+
+// ---------------------------------------------------------------------------
 // Parser wrapper
 // ---------------------------------------------------------------------------
 
@@ -36,15 +102,24 @@ pub mod kinds {
 /// incremental parsing support.
 pub struct JsonParser {
     parser: Parser,
+    pub kind_ids: KindIds,
+    pub field_ids: FieldIds,
 }
 
 impl JsonParser {
     pub fn new() -> Self {
         let mut parser = Parser::new();
+        let lang: tree_sitter::Language = tree_sitter_json::LANGUAGE.into();
         parser
-            .set_language(&tree_sitter_json::LANGUAGE.into())
+            .set_language(&lang)
             .expect("failed to load tree-sitter-json grammar");
-        JsonParser { parser }
+        let kind_ids = KindIds::new(&lang);
+        let field_ids = FieldIds::new(&lang);
+        JsonParser {
+            parser,
+            kind_ids,
+            field_ids,
+        }
     }
 
     /// Parse source text from scratch.
