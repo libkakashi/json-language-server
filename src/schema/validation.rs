@@ -54,6 +54,7 @@ pub fn validate<'a>(
     let mut errors = Vec::new();
     let ref_chain: HashSet<String> = HashSet::new();
     validate_node(node, source, schema, &mut errors, &ref_chain, regex_cache);
+    warn_unknown_properties(node, source, schema, &mut errors, regex_cache);
     errors
 }
 
@@ -358,6 +359,146 @@ fn validate_number(
     }
 }
 
+/// Check whether a property name is known anywhere in the schema tree,
+/// including composition sub-schemas (allOf/anyOf/oneOf) and conditionals.
+fn schema_knows_property(schema: &JsonSchema, key: &str, regex_cache: &mut RegexCache) -> bool {
+    if schema.properties.contains_key(key) {
+        return true;
+    }
+    for (pattern, _) in &schema.pattern_properties {
+        if let Some(re) = regex_cache.get(pattern) {
+            if re.is_match(key) {
+                return true;
+            }
+        }
+    }
+    if schema.additional_properties.is_some() {
+        return true;
+    }
+    for sub in schema
+        .all_of
+        .iter()
+        .chain(schema.any_of.iter())
+        .chain(schema.one_of.iter())
+    {
+        if schema_knows_property(sub, key, regex_cache) {
+            return true;
+        }
+    }
+    if let Some(ref then_schema) = schema.then_schema {
+        if schema_knows_property(then_schema, key, regex_cache) {
+            return true;
+        }
+    }
+    if let Some(ref else_schema) = schema.else_schema {
+        if schema_knows_property(else_schema, key, regex_cache) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check whether a schema (or any of its composition sub-schemas) defines
+/// any known properties, meaning we have enough information to warn about
+/// unknown ones.
+fn schema_has_known_properties(schema: &JsonSchema) -> bool {
+    if !schema.properties.is_empty() || !schema.pattern_properties.is_empty() {
+        return true;
+    }
+    for sub in schema
+        .all_of
+        .iter()
+        .chain(schema.any_of.iter())
+        .chain(schema.one_of.iter())
+    {
+        if schema_has_known_properties(sub) {
+            return true;
+        }
+    }
+    if let Some(ref then_schema) = schema.then_schema {
+        if schema_has_known_properties(then_schema) {
+            return true;
+        }
+    }
+    if let Some(ref else_schema) = schema.else_schema {
+        if schema_has_known_properties(else_schema) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Walk the tree-sitter AST and emit warnings for object properties that are
+/// not declared anywhere in the corresponding schema (including composition
+/// and conditional sub-schemas). This runs as a separate pass after the main
+/// validation so that the full schema context is available at each level.
+fn warn_unknown_properties(
+    node: Node<'_>,
+    source: &[u8],
+    schema: &Arc<JsonSchema>,
+    errors: &mut Vec<ValidationError>,
+    regex_cache: &mut RegexCache,
+) {
+    if node.kind() == kinds::OBJECT {
+        // Only warn when the schema declares known properties and does not
+        // already have an additionalProperties constraint (which is handled
+        // by the main validation pass).
+        if schema.additional_properties.is_none() && schema_has_known_properties(schema) {
+            let mut cursor = node.walk();
+            for pair in tree::object_pairs(node, &mut cursor) {
+                let key_node = match pair.child_by_field_name("key") {
+                    Some(k) => k,
+                    None => continue,
+                };
+                let key_str = match tree::string_value(key_node, source) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                if !schema_knows_property(schema, &key_str, regex_cache) {
+                    errors.push(ValidationError {
+                        start_byte: key_node.start_byte(),
+                        end_byte: key_node.end_byte(),
+                        message: format!("Unknown property \"{key_str}\"."),
+                        severity: Severity::Warning,
+                    });
+                }
+            }
+        }
+
+        // Recurse into child values with their resolved sub-schemas.
+        let mut cursor = node.walk();
+        for pair in tree::object_pairs(node, &mut cursor) {
+            let key_str = match tree::pair_key_unescaped(pair, source) {
+                Some(k) => k,
+                None => continue,
+            };
+            let value_node = match tree::pair_value(pair) {
+                Some(v) => v,
+                None => continue,
+            };
+            if let Some(child_schema) = schema.resolve_path_segment(&key_str) {
+                warn_unknown_properties(value_node, source, &child_schema, errors, regex_cache);
+            }
+        }
+    } else if node.kind() == kinds::ARRAY {
+        let mut cursor = node.walk();
+        let items = tree::array_items(node, &mut cursor);
+        for (i, item) in items.iter().enumerate() {
+            // Try prefixItems first, then items.
+            let child_schema = if let Some(ps) = schema.prefix_items.get(i) {
+                Some(ps.clone())
+            } else if let Some(ref items_schema) = schema.items {
+                items_schema.as_schema().cloned()
+            } else {
+                None
+            };
+            if let Some(cs) = child_schema {
+                warn_unknown_properties(*item, source, &cs, errors, regex_cache);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Object
 // ---------------------------------------------------------------------------
@@ -454,21 +595,23 @@ fn validate_object(
         }
 
         // Additional properties.
-        if !matched && let Some(ref ap) = schema.additional_properties {
-            if ap.is_false() {
-                errors.push(err(
-                    key_node,
-                    format!("Property \"{key_str}\" is not allowed."),
-                ));
-            } else if let Some(ap_schema) = ap.as_schema() {
-                validate_node(
-                    value_node,
-                    source,
-                    ap_schema,
-                    errors,
-                    ref_chain,
-                    regex_cache,
-                );
+        if !matched {
+            if let Some(ref ap) = schema.additional_properties {
+                if ap.is_false() {
+                    errors.push(err(
+                        key_node,
+                        format!("Property \"{key_str}\" is not allowed."),
+                    ));
+                } else if let Some(ap_schema) = ap.as_schema() {
+                    validate_node(
+                        value_node,
+                        source,
+                        ap_schema,
+                        errors,
+                        ref_chain,
+                        regex_cache,
+                    );
+                }
             }
         }
     }
@@ -1156,6 +1299,84 @@ mod tests {
         let errors = validate_json(r#""old""#, r#"{"deprecated": true}"#);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].severity, Severity::Warning);
+    }
+
+    // -- Unknown property warnings --
+
+    #[test]
+    fn unknown_property_warning() {
+        let errors = validate_json(
+            r#"{"a": 1, "b": 2}"#,
+            r#"{"type": "object", "properties": {"a": {}}}"#,
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].severity, Severity::Warning);
+        assert!(errors[0].message.contains("\"b\""));
+    }
+
+    #[test]
+    fn unknown_property_no_warning_when_additional_properties_true() {
+        let errors = validate_json(
+            r#"{"a": 1, "b": 2}"#,
+            r#"{"type": "object", "properties": {"a": {}}, "additionalProperties": true}"#,
+        );
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn unknown_property_no_warning_when_no_properties_defined() {
+        // Schema with no properties at all — no basis to warn.
+        let errors = validate_json(r#"{"a": 1, "b": 2}"#, r#"{"type": "object"}"#);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn unknown_property_allof_siblings() {
+        // Property defined in a sibling allOf sub-schema should not warn.
+        let errors = validate_json(
+            r#"{"a": 1, "b": 2}"#,
+            r#"{"allOf": [{"properties": {"a": {}}}, {"properties": {"b": {}}}]}"#,
+        );
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn unknown_property_allof_unknown() {
+        // Property not in any allOf sub-schema should warn.
+        let errors = validate_json(
+            r#"{"a": 1, "c": 3}"#,
+            r#"{"allOf": [{"properties": {"a": {}}}, {"properties": {"b": {}}}]}"#,
+        );
+        let warnings: Vec<_> = errors
+            .iter()
+            .filter(|e| e.severity == Severity::Warning && e.message.contains("Unknown"))
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("\"c\""));
+    }
+
+    #[test]
+    fn unknown_property_nested_object() {
+        let errors = validate_json(
+            r#"{"nested": {"known": 1, "typo": 2}}"#,
+            r#"{"type": "object", "properties": {"nested": {"type": "object", "properties": {"known": {}}}}}"#,
+        );
+        let warnings: Vec<_> = errors
+            .iter()
+            .filter(|e| e.severity == Severity::Warning && e.message.contains("Unknown"))
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("\"typo\""));
+    }
+
+    #[test]
+    fn unknown_property_pattern_properties_match() {
+        // Property matching a patternProperty should not warn.
+        let errors = validate_json(
+            r#"{"x-custom": 1}"#,
+            r#"{"type": "object", "properties": {"name": {}}, "patternProperties": {"^x-": {}}}"#,
+        );
+        assert!(errors.is_empty());
     }
 }
 
