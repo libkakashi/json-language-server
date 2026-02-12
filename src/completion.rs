@@ -30,16 +30,22 @@ pub fn completions(
                 complete_property_names(doc, object, &sub, &mut items);
             }
         }
-        Context::PropertyValue { object, key } => {
+        Context::PropertyValue {
+            object,
+            key,
+            has_value,
+        } => {
             if let Some(schema) = schema {
                 let sub = resolve_schema_for_node(doc, object, schema);
                 if let Some(prop_schema) = sub.properties.get(&key) {
                     complete_value(prop_schema, &mut items);
                 }
             }
-            // Always offer structural completions.
-            items.push(snippet_item("{ }", "Empty object", "{$1}"));
-            items.push(snippet_item("[ ]", "Empty array", "[$1]"));
+            if !has_value {
+                // Offer structural completions only when no value exists yet.
+                items.push(snippet_item("{ }", "Empty object", "{$1}"));
+                items.push(snippet_item("[ ]", "Empty array", "[$1]"));
+            }
         }
         Context::ArrayItem { array, index } => {
             if let Some(schema) = schema {
@@ -60,9 +66,18 @@ pub fn completions(
 // ---------------------------------------------------------------------------
 
 enum Context<'a> {
-    PropertyName { object: Node<'a> },
-    PropertyValue { object: Node<'a>, key: String },
-    ArrayItem { array: Node<'a>, index: usize },
+    PropertyName {
+        object: Node<'a>,
+    },
+    PropertyValue {
+        object: Node<'a>,
+        key: String,
+        has_value: bool,
+    },
+    ArrayItem {
+        array: Node<'a>,
+        index: usize,
+    },
     None,
 }
 
@@ -90,7 +105,11 @@ fn determine_context<'a>(doc: &'a Document, offset: usize) -> Context<'a> {
                 if colon_pos > last_sep
                     && let Some(key) = find_key_at_colon(doc, node, colon_pos)
                 {
-                    return Context::PropertyValue { object: node, key };
+                    return Context::PropertyValue {
+                        object: node,
+                        key,
+                        has_value: false,
+                    };
                 }
             }
             Context::PropertyName { object: node }
@@ -117,7 +136,11 @@ fn determine_context<'a>(doc: &'a Document, offset: usize) -> Context<'a> {
                     // Value string.
                     if let Some(object) = pair.parent().filter(|p| p.kind() == kinds::OBJECT) {
                         let key = tree::pair_key_unescaped(pair, doc.source()).unwrap_or_default();
-                        return Context::PropertyValue { object, key };
+                        return Context::PropertyValue {
+                            object,
+                            key,
+                            has_value: true,
+                        };
                     }
                 }
             }
@@ -127,7 +150,11 @@ fn determine_context<'a>(doc: &'a Document, offset: usize) -> Context<'a> {
             // Cursor might be between key and value.
             if let Some(object) = node.parent().filter(|p| p.kind() == kinds::OBJECT) {
                 let key = tree::pair_key_unescaped(node, doc.source()).unwrap_or_default();
-                return Context::PropertyValue { object, key };
+                return Context::PropertyValue {
+                    object,
+                    key,
+                    has_value: false,
+                };
             }
             Context::None
         }
@@ -137,7 +164,11 @@ fn determine_context<'a>(doc: &'a Document, offset: usize) -> Context<'a> {
                 && let Some(object) = pair.parent().filter(|p| p.kind() == kinds::OBJECT)
             {
                 let key = tree::pair_key_unescaped(pair, doc.source()).unwrap_or_default();
-                return Context::PropertyValue { object, key };
+                return Context::PropertyValue {
+                    object,
+                    key,
+                    has_value: true,
+                };
             }
             if let Some(array) = node.parent().filter(|p| p.kind() == kinds::ARRAY) {
                 let mut cursor = array.walk();
