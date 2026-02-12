@@ -4,12 +4,10 @@
 /// when hovering over a key or value.
 use std::sync::Arc;
 
-use lsp_types::*;
-use tree_sitter::Node;
-
 use crate::document::Document;
 use crate::schema::types::*;
 use crate::tree::{self, kinds};
+use lsp_types::*;
 
 /// Produce hover information at a byte offset.
 pub fn hover(doc: &Document, offset: usize, schema: Option<&Arc<JsonSchema>>) -> Option<Hover> {
@@ -17,15 +15,26 @@ pub fn hover(doc: &Document, offset: usize, schema: Option<&Arc<JsonSchema>>) ->
 
     let mut sections: Vec<String> = Vec::new();
 
+    // Compute path segments once, reuse for display and schema resolution.
+    let path_segments = tree::json_path(node, doc.source());
+
     // JSON path.
-    let path = tree::json_pointer(node, doc.source());
-    if !path.is_empty() {
-        sections.push(format!("`{path}`"));
+    if !path_segments.is_empty() {
+        // Single allocation: `/<seg>/<seg>` wrapped in backticks.
+        let cap = 2 + path_segments.iter().map(|s| 1 + s.len()).sum::<usize>();
+        let mut pointer = String::with_capacity(cap);
+        pointer.push('`');
+        for seg in &path_segments {
+            pointer.push('/');
+            pointer.push_str(seg);
+        }
+        pointer.push('`');
+        sections.push(pointer);
     }
 
     // Schema info.
     if let Some(root_schema) = schema
-        && let Some(sub) = resolve_schema_for_hover(doc, node, root_schema)
+        && let Some(sub) = resolve_schema_with_path(&path_segments, root_schema)
     {
         if let Some(desc) = sub
             .markdown_description
@@ -87,14 +96,12 @@ pub fn hover(doc: &Document, offset: usize, schema: Option<&Arc<JsonSchema>>) ->
     })
 }
 
-fn resolve_schema_for_hover(
-    doc: &Document,
-    node: Node<'_>,
+fn resolve_schema_with_path(
+    path: &[String],
     root_schema: &Arc<JsonSchema>,
 ) -> Option<Arc<JsonSchema>> {
-    let path = tree::json_path(node, doc.source());
     let mut current = root_schema.clone();
-    for seg in &path {
+    for seg in path {
         current = current.resolve_path_segment(seg)?;
     }
     Some(current)
