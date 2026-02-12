@@ -6,6 +6,102 @@ Built on [tree-sitter](https://tree-sitter.github.io/) for fast, incremental, er
 
 ---
 
+## Performance
+
+Benchmarked against [vscode-json-languageservice](https://github.com/microsoft/vscode-json-languageservice), the Node.js JSON language service used by VS Code. All times are in milliseconds. Three document sizes were tested: small (1.1 KB), medium (50 KB), and large (500 KB).
+
+### Latency
+
+| Scenario | Size | Metric | json-language-server (Rust) | vscode-json-languageservice (Node) | Winner |
+|---|---|---|--:|--:|---|
+| **Startup** | — | p50 | 11.7 | 52.9 | Rust (4.5x) |
+| | — | p95 | 14.2 | 55.8 | Rust (3.9x) |
+| | — | mean | 11.1 | 53.4 | Rust (4.8x) |
+| **Open + Diagnostics** | small | p50 | 33.4 | 304 | Rust (9.1x) |
+| | small | p95 | 35.2 | 306 | Rust (8.7x) |
+| | small | mean | 33.3 | 304 | Rust (9.1x) |
+| | medium | p50 | 38.5 | 307 | Rust (8.0x) |
+| | medium | p95 | 39.3 | 311 | Rust (7.9x) |
+| | medium | mean | 37.6 | 307 | Rust (8.2x) |
+| | large | p50 | 50.9 | 331 | Rust (6.5x) |
+| | large | p95 | 51.9 | 344 | Rust (6.6x) |
+| | large | mean | 50.1 | 333 | Rust (6.6x) |
+| **Completion** | small | p50 | 0.097 | 0.319 | Rust (3.3x) |
+| | small | p95 | 0.134 | 0.662 | Rust (4.9x) |
+| | small | mean | 0.103 | 0.357 | Rust (3.5x) |
+| | medium | p50 | 0.078 | 0.200 | Rust (2.6x) |
+| | medium | p95 | 0.286 | 0.950 | Rust (3.3x) |
+| | medium | mean | 0.269 | 0.503 | Rust (1.9x) |
+| | large | p50 | 0.041 | 0.121 | Rust (3.0x) |
+| | large | p95 | 1.14 | 2.21 | Rust (1.9x) |
+| | large | mean | 1.11 | 0.867 | Node (1.3x) |
+| **Hover** | small | p50 | 0.119 | 0.241 | Rust (2.0x) |
+| | small | p95 | 0.197 | 0.620 | Rust (3.1x) |
+| | small | mean | 0.136 | 0.307 | Rust (2.2x) |
+| | medium | p50 | 0.063 | 0.182 | Rust (2.9x) |
+| | medium | p95 | 0.275 | 0.709 | Rust (2.6x) |
+| | medium | mean | 0.263 | 0.459 | Rust (1.7x) |
+| | large | p50 | 0.050 | 0.118 | Rust (2.3x) |
+| | large | p95 | 1.19 | 2.02 | Rust (1.7x) |
+| | large | mean | 1.14 | 0.835 | Node (1.4x) |
+| **Document Symbols** | small | p50 | 0.217 | 0.322 | Rust (1.5x) |
+| | small | p95 | 0.305 | 0.848 | Rust (2.8x) |
+| | small | mean | 0.235 | 0.396 | Rust (1.7x) |
+| | medium | p50 | 2.15 | 2.29 | Rust (1.1x) |
+| | medium | p95 | 2.90 | 4.33 | Rust (1.5x) |
+| | medium | mean | 2.40 | 2.67 | Rust (1.1x) |
+| | large | p50 | 20.2 | 21.0 | Rust (1.0x) |
+| | large | p95 | 21.6 | 30.2 | Rust (1.4x) |
+| | large | mean | 21.2 | 22.0 | Rust (1.0x) |
+| **Edit + Diagnostics** | small | p50 | 1.10 | 304 | Rust (275x) |
+| | small | p95 | 1.37 | 305 | Rust (223x) |
+| | small | mean | 1.09 | 304 | Rust (279x) |
+| | medium | p50 | 6.83 | 307 | Rust (45x) |
+| | medium | p95 | 8.56 | 314 | Rust (37x) |
+| | medium | mean | 6.82 | 308 | Rust (45x) |
+| | large | p50 | 27.7 | 332 | Rust (12x) |
+| | large | p95 | 38.3 | 342 | Rust (8.9x) |
+| | large | mean | 28.1 | 333 | Rust (12x) |
+
+### Memory (KB RSS)
+
+| Phase | json-language-server (Rust) | vscode-json-languageservice (Node) | Ratio |
+|---|--:|--:|---|
+| Idle | 7,232 | 57,536 | 8.0x less |
+| Peak (small) | 8,480 | 58,240 | 6.9x less |
+| Peak (medium) | 9,552 | 61,056 | 6.4x less |
+| Peak (large) | 21,120 | 81,504 | 3.9x less |
+
+### Feature Parity
+
+Comparison with [vscode-json-languageservice](https://github.com/microsoft/vscode-json-languageservice):
+
+| Feature | json-language-server (Rust) | vscode-json-languageservice (Node) |
+|---|:---:|:---:|
+| JSON Schema validation | :white_check_mark: | :white_check_mark: |
+| Schema drafts 4, 6, 7, 2019-09, 2020-12 | :white_check_mark: | :white_check_mark: |
+| Code completion | :white_check_mark: | :white_check_mark: |
+| Completion resolve | :x: | :white_check_mark: |
+| Hover information | :white_check_mark: | :white_check_mark: |
+| Document symbols | :white_check_mark: | :white_check_mark: |
+| Document colors | :white_check_mark: | :white_check_mark: |
+| Color presentations | :white_check_mark: | :white_check_mark: |
+| Document formatting | :white_check_mark: | :white_check_mark: |
+| Document sorting | :white_check_mark: | :white_check_mark: |
+| Folding ranges | :white_check_mark: | :white_check_mark: |
+| Selection ranges | :white_check_mark: | :white_check_mark: |
+| Document links | :white_check_mark: | :white_check_mark: |
+| Go to definition | :white_check_mark: | :white_check_mark: |
+| Syntax diagnostics | :white_check_mark: | :white_check_mark: |
+| `$ref` resolution | :white_check_mark: | :white_check_mark: |
+| VS Code schema extensions | :white_check_mark: | :white_check_mark: |
+| Schema matching / language status | :x: | :white_check_mark: |
+| Incremental parsing (tree-sitter) | :white_check_mark: | :x: |
+| Incremental document sync | :white_check_mark: | :x: |
+| JSONC tolerance (comments, trailing commas) | :white_check_mark: | :white_check_mark: |
+
+---
+
 ## Features
 
 ### Intelligent Completions
