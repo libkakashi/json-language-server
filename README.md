@@ -109,7 +109,7 @@ Or install directly:
 cargo install --path .
 ```
 
-Release profile: `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `strip = true`, `panic = "abort"`.
+The release binary is **~2.7 MB** (stripped, arm64). Release profile: `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `strip = true`, `panic = "abort"`.
 
 Requires Rust 2024 edition (1.85+).
 
