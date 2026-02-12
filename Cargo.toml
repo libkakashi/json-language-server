@@ -24,6 +24,9 @@ globset = "0.4"
 percent-encoding = "2"
 lru = "0.12"
 
+# Concurrency
+parking_lot = "0.12"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

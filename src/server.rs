@@ -1,7 +1,9 @@
 /// LSP server: wires all features together via lsp-server.
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::{Mutex, RwLock};
 
 use crossbeam_channel::Sender;
 use lsp_server::{Connection, ExtractError, Message, Notification, Request, RequestId, Response};
@@ -34,7 +36,7 @@ const DEBOUNCE_MS: u64 = 75;
 
 /// Shared state that background threads (debounced validation) can access.
 struct Shared {
-    state: Mutex<ServerState>,
+    state: RwLock<ServerState>,
     regex_cache: Mutex<RegexCache>,
     debounce_versions: Mutex<HashMap<Uri, u64>>,
 }
@@ -49,7 +51,7 @@ impl JsonLanguageServer {
         JsonLanguageServer {
             connection,
             shared: Arc::new(Shared {
-                state: Mutex::new(ServerState {
+                state: RwLock::new(ServerState {
                     documents: DocumentStore::new(),
                     schemas: SchemaStore::new(),
                 }),
@@ -290,7 +292,7 @@ impl JsonLanguageServer {
         inline_schema_uri: Option<&str>,
     ) -> Option<Arc<JsonSchema>> {
         let lookup = {
-            let mut state = self.shared.state.lock().unwrap();
+            let mut state = self.shared.state.write();
             state
                 .schemas
                 .schema_for_document(doc_uri, inline_schema_uri)
@@ -299,13 +301,12 @@ impl JsonLanguageServer {
         match lookup {
             SchemaLookup::Resolved(schema) => Some(schema),
             SchemaLookup::NeedsFetch(uri) => {
-                let agent = self.shared.state.lock().unwrap().schemas.http_agent();
+                let agent = self.shared.state.write().schemas.http_agent();
                 let raw = resolver::fetch_schema(&agent, &uri)?;
                 let schema = JsonSchema::from_value(&raw);
                 self.shared
                     .state
-                    .lock()
-                    .unwrap()
+                    .write()
                     .schemas
                     .insert_cache(uri, schema.clone());
                 Some(schema)
@@ -317,7 +318,7 @@ impl JsonLanguageServer {
     /// Schedule a debounced validation on a background thread.
     fn debounced_validate(&self, uri: Uri) {
         let version = {
-            let mut versions = self.shared.debounce_versions.lock().unwrap();
+            let mut versions = self.shared.debounce_versions.lock();
             let v = versions.entry(uri.clone()).or_insert(0);
             *v += 1;
             *v
@@ -331,7 +332,7 @@ impl JsonLanguageServer {
 
             // Check if a newer edit superseded this one.
             let current = {
-                let versions = shared.debounce_versions.lock().unwrap();
+                let versions = shared.debounce_versions.lock();
                 versions.get(&uri).copied().unwrap_or(0)
             };
             if current != version {
@@ -360,7 +361,7 @@ impl JsonLanguageServer {
         let uri = params.text_document.uri.clone();
         debug!("did_open: {}", uri.as_str());
         {
-            let mut state = self.shared.state.lock().unwrap();
+            let mut state = self.shared.state.write();
             state.documents.open(
                 params.text_document.uri,
                 params.text_document.text,
@@ -374,7 +375,7 @@ impl JsonLanguageServer {
         let uri = params.text_document.uri.clone();
         debug!("did_change: {}", uri.as_str());
         {
-            let mut state = self.shared.state.lock().unwrap();
+            let mut state = self.shared.state.write();
             if let Some(doc) = state.documents.get_mut(&uri) {
                 for change in params.content_changes {
                     match change.range {
@@ -399,7 +400,7 @@ impl JsonLanguageServer {
     fn on_did_close(&self, params: DidCloseTextDocumentParams) {
         debug!("did_close: {}", params.text_document.uri.as_str());
         {
-            let mut state = self.shared.state.lock().unwrap();
+            let mut state = self.shared.state.write();
             state.documents.close(&params.text_document.uri);
         }
         self.send_notification::<notification::PublishDiagnostics>(PublishDiagnosticsParams {
@@ -446,7 +447,7 @@ impl JsonLanguageServer {
                 })
                 .collect();
 
-            let mut state = self.shared.state.lock().unwrap();
+            let mut state = self.shared.state.write();
             state.schemas.set_associations(associations);
         }
     }
@@ -460,7 +461,7 @@ impl JsonLanguageServer {
         let pos = params.text_document_position_params.position;
 
         let (offset, inline_schema) = {
-            let state = self.shared.state.lock().unwrap();
+            let state = self.shared.state.read();
             let doc = match state.documents.get(uri) {
                 Some(d) => d,
                 None => return self.send_response(id, Option::<Hover>::None),
@@ -473,7 +474,7 @@ impl JsonLanguageServer {
         let uri_str = uri.as_str().to_string();
         let schema = self.resolve_schema(&uri_str, inline_schema.as_deref());
 
-        let state = self.shared.state.lock().unwrap();
+        let state = self.shared.state.read();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
             None => return self.send_response(id, Option::<Hover>::None),
@@ -492,7 +493,7 @@ impl JsonLanguageServer {
         let pos = params.text_document_position.position;
 
         let (offset, inline_schema) = {
-            let state = self.shared.state.lock().unwrap();
+            let state = self.shared.state.read();
             let doc = match state.documents.get(uri) {
                 Some(d) => d,
                 None => return self.send_response(id, Option::<CompletionResponse>::None),
@@ -505,7 +506,7 @@ impl JsonLanguageServer {
         let uri_str = uri.as_str().to_string();
         let schema = self.resolve_schema(&uri_str, inline_schema.as_deref());
 
-        let state = self.shared.state.lock().unwrap();
+        let state = self.shared.state.read();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
             None => return self.send_response(id, Option::<CompletionResponse>::None),
@@ -526,7 +527,7 @@ impl JsonLanguageServer {
 
     fn on_document_symbol(&self, id: RequestId, params: DocumentSymbolParams) {
         let uri = &params.text_document.uri;
-        let state = self.shared.state.lock().unwrap();
+        let state = self.shared.state.read();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
             None => return self.send_response(id, Option::<DocumentSymbolResponse>::None),
@@ -545,7 +546,7 @@ impl JsonLanguageServer {
 
     fn on_formatting(&self, id: RequestId, params: DocumentFormattingParams) {
         let uri = &params.text_document.uri;
-        let state = self.shared.state.lock().unwrap();
+        let state = self.shared.state.read();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
             None => return self.send_response(id, Option::<Vec<TextEdit>>::None),
@@ -556,7 +557,7 @@ impl JsonLanguageServer {
 
     fn on_range_formatting(&self, id: RequestId, params: DocumentRangeFormattingParams) {
         let uri = &params.text_document.uri;
-        let state = self.shared.state.lock().unwrap();
+        let state = self.shared.state.read();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
             None => return self.send_response(id, Option::<Vec<TextEdit>>::None),
@@ -571,7 +572,7 @@ impl JsonLanguageServer {
 
     fn on_document_color(&self, id: RequestId, params: DocumentColorParams) {
         let uri = &params.text_document.uri;
-        let state = self.shared.state.lock().unwrap();
+        let state = self.shared.state.read();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
             None => return self.send_response(id, Vec::<ColorInformation>::new()),
@@ -591,7 +592,7 @@ impl JsonLanguageServer {
 
     fn on_folding_range(&self, id: RequestId, params: FoldingRangeParams) {
         let uri = &params.text_document.uri;
-        let state = self.shared.state.lock().unwrap();
+        let state = self.shared.state.read();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
             None => return self.send_response(id, Option::<Vec<FoldingRange>>::None),
@@ -606,7 +607,7 @@ impl JsonLanguageServer {
 
     fn on_selection_range(&self, id: RequestId, params: SelectionRangeParams) {
         let uri = &params.text_document.uri;
-        let state = self.shared.state.lock().unwrap();
+        let state = self.shared.state.read();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
             None => return self.send_response(id, Option::<Vec<SelectionRange>>::None),
@@ -621,7 +622,7 @@ impl JsonLanguageServer {
 
     fn on_document_link(&self, id: RequestId, params: DocumentLinkParams) {
         let uri = &params.text_document.uri;
-        let state = self.shared.state.lock().unwrap();
+        let state = self.shared.state.read();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
             None => return self.send_response(id, Option::<Vec<DocumentLink>>::None),
@@ -638,7 +639,7 @@ impl JsonLanguageServer {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
 
-        let state = self.shared.state.lock().unwrap();
+        let state = self.shared.state.read();
         let doc = match state.documents.get(uri) {
             Some(d) => d,
             None => return self.send_response(id, Option::<GotoDefinitionResponse>::None),
@@ -667,7 +668,7 @@ impl JsonLanguageServer {
                         && let Some(uri_str) = uri_val.as_str()
                         && let Ok(uri) = Uri::from_str(uri_str)
                     {
-                        let state = self.shared.state.lock().unwrap();
+                        let state = self.shared.state.read();
                         if let Some(doc) = state.documents.get(&uri) {
                             let edits = formatting::sort_document(doc);
                             if !edits.is_empty() {
@@ -716,12 +717,12 @@ impl JsonLanguageServer {
 
 fn validate_and_publish(
     uri: &Uri,
-    state: &Mutex<ServerState>,
+    state: &RwLock<ServerState>,
     regex_cache: &Mutex<RegexCache>,
     sender: &Sender<Message>,
 ) {
     let (mut diags, version, needs_schema, uri_str, inline_schema) = {
-        let state = state.lock().unwrap();
+        let state = state.read();
 
         let doc = match state.documents.get(uri) {
             Some(d) => d,
@@ -744,7 +745,7 @@ fn validate_and_publish(
     if needs_schema {
         let schema = {
             let lookup = {
-                let mut state = state.lock().unwrap();
+                let mut state = state.write();
                 state
                     .schemas
                     .schema_for_document(&uri_str, inline_schema.as_deref())
@@ -753,13 +754,12 @@ fn validate_and_publish(
             match lookup {
                 SchemaLookup::Resolved(schema) => Some(schema),
                 SchemaLookup::NeedsFetch(fetch_uri) => {
-                    let agent = state.lock().unwrap().schemas.http_agent();
+                    let agent = state.write().schemas.http_agent();
                     let raw = resolver::fetch_schema(&agent, &fetch_uri);
                     raw.map(|r| {
                         let schema = JsonSchema::from_value(&r);
                         state
-                            .lock()
-                            .unwrap()
+                            .write()
                             .schemas
                             .insert_cache(fetch_uri, schema.clone());
                         schema
@@ -769,8 +769,8 @@ fn validate_and_publish(
             }
         };
 
-        let state = state.lock().unwrap();
-        let mut regex_cache = regex_cache.lock().unwrap();
+        let state = state.read();
+        let mut regex_cache = regex_cache.lock();
         if let (Some(schema), Some(doc)) = (schema, state.documents.get(uri))
             && let Some(root) = tree::root_value(&doc.tree)
         {
