@@ -1,6 +1,6 @@
-# json-language-server
+# light-json-lsp
 
-A high-performance JSON Language Server written in Rust, implementing the [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) (LSP). Provides rich editing features for JSON files with full support for JSON Schema drafts 4 through 2020-12.
+A lightweight, high-performance JSON Language Server written in Rust, implementing the [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) (LSP). Provides rich editing features for JSON files with full support for JSON Schema drafts 4 through 2020-12.
 
 Built on [tree-sitter](https://tree-sitter.github.io/) for fast, incremental, error-recovering parsing and [lsp-server](https://github.com/rust-lang/rust-analyzer/tree/master/lib/lsp-server) for synchronous LSP transport.
 
@@ -65,7 +65,7 @@ Benchmarked against [vscode-json-languageservice](https://github.com/microsoft/v
 
 ### Memory (KB RSS)
 
-| Phase | json-language-server (Rust) | vscode-json-languageservice (Node) | Ratio |
+| Phase | light-json-lsp (Rust) | vscode-json-languageservice (Node) | Ratio |
 |---|--:|--:|---|
 | Idle | 7,232 | 57,536 | 8.0x less |
 | Peak (small) | 8,480 | 58,240 | 6.9x less |
@@ -120,9 +120,9 @@ After `cargo install --path .`, add to your Zed settings (`~/.config/zed/setting
 ```json
 {
   "lsp": {
-    "json-language-server": {
+    "light-json-lsp": {
       "binary": {
-        "path": "json-language-server",
+        "path": "light-json-lsp",
         "arguments": []
       }
     }
@@ -132,7 +132,7 @@ After `cargo install --path .`, add to your Zed settings (`~/.config/zed/setting
 
 ### VS Code
 
-Point a generic LSP client extension (e.g. [vscode-languageclient](https://github.com/microsoft/vscode-languageserver-node)) at the `json-language-server` binary. The server communicates over stdin/stdout.
+Point a generic LSP client extension (e.g. [vscode-languageclient](https://github.com/microsoft/vscode-languageserver-node)) at the `light-json-lsp` binary. The server communicates over stdin/stdout.
 
 ### Schema Configuration
 
@@ -158,7 +158,7 @@ Documents can also specify their own schema via the `$schema` property.
 ### Logging
 
 ```sh
-RUST_LOG=debug json-language-server
+RUST_LOG=debug light-json-lsp
 ```
 
 ---

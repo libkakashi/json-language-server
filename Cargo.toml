@@ -1,5 +1,5 @@
 [package]
-name = "json-language-server"
+name = "light-json-lsp"
 version = "0.1.0"
 edition = "2024"
 
