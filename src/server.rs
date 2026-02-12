@@ -707,7 +707,8 @@ impl JsonLanguageServer {
 
 /// Long-lived worker that processes validation requests sequentially.
 /// When a request arrives, all queued requests are drained and only the
-/// last URI is validated — the worker being busy is the natural throttle.
+/// last URI is validated — the worker being busy plus a short sleep
+/// provide natural throttling for rapid keystrokes.
 fn validation_worker(rx: Receiver<Uri>, shared: Arc<Shared>, sender: Sender<Message>) {
     while let Ok(mut uri) = rx.recv() {
         // Drain any queued requests, keeping only the latest URI.
@@ -729,114 +730,71 @@ fn validate_and_publish(
     regex_cache: &Mutex<RegexCache>,
     sender: &Sender<Message>,
 ) {
-    // Helper to send a log message to the client.
-    let log = |msg: String| {
-        let params = LogMessageParams {
-            typ: MessageType::LOG,
-            message: msg,
+    // Single read-lock snapshot: extract everything we need for schema lookup
+    // and syntax diagnostics in one pass.
+    let (mut diags, version, uri_str, inline_schema) = {
+        let state = state.read();
+        let doc = match state.documents.get(uri) {
+            Some(d) => d,
+            None => return,
         };
-        let not = Notification::new(
-            notification::LogMessage::METHOD.into(),
-            serde_json::to_value(params).unwrap(),
-        );
-        sender.send(Message::Notification(not)).ok();
+        let diags = diagnostics::syntax_diagnostics(doc);
+        let version = Some(doc.version);
+        let uri_str = uri.as_str().to_string();
+        let inline_schema = crate::schema::resolver::extract_schema_property(doc);
+        (diags, version, uri_str, inline_schema)
     };
 
-    // Resolve the schema eagerly — even when the tree has syntax errors.
-    // Schema resolution (especially the initial HTTP fetch) must not be
-    // blocked by transient parse errors, otherwise the first edit that
-    // introduces a syntax error prevents the schema from ever being fetched
-    // until a save produces a clean tree.
-    let schema = {
-        let (uri_str, inline_schema) = {
-            let state = state.read();
-            let doc = match state.documents.get(uri) {
-                Some(d) => d,
-                None => return,
-            };
-            let uri_str = uri.as_str().to_string();
-            let inline_schema = crate::schema::resolver::extract_schema_property(doc);
-            log(format!(
-                "[validate] uri={}, version={}, has_error={}, inline_schema={:?}",
-                uri_str,
-                doc.version,
-                doc.tree.root_node().has_error(),
-                inline_schema,
-            ));
-            (uri_str, inline_schema)
-        };
-
-        let lookup = {
-            let state = state.read();
-            state
-                .schemas
-                .schema_for_document(&uri_str, inline_schema.as_deref())
-        };
-        match lookup {
-            SchemaLookup::Resolved(schema) => {
-                log("[validate] schema=Resolved".into());
-                Some(schema)
-            }
-            SchemaLookup::NeedsFetch(fetch_uri) => {
-                log(format!("[validate] schema=NeedsFetch({})", fetch_uri));
-                let agent = state.write().schemas.http_agent();
-                let raw = resolver::fetch_schema(&agent, &fetch_uri);
-                raw.map(|r| {
-                    let schema = JsonSchema::from_value(&r);
-                    state
-                        .write()
-                        .schemas
-                        .insert_cache(fetch_uri, schema.clone());
-                    schema
-                })
-            }
-            SchemaLookup::None => {
-                log("[validate] schema=None".into());
-                None
-            }
+    // Resolve the schema. This re-acquires the read lock (and possibly the
+    // write lock for HTTP fetch), but only for the schema store lookup.
+    let lookup = {
+        let state = state.read();
+        state
+            .schemas
+            .schema_for_document(&uri_str, inline_schema.as_deref())
+    };
+    let schema = match lookup {
+        SchemaLookup::Resolved(schema) => Some(schema),
+        SchemaLookup::NeedsFetch(fetch_uri) => {
+            let agent = state.write().schemas.http_agent();
+            let raw = resolver::fetch_schema(&agent, &fetch_uri);
+            raw.map(|r| {
+                let schema = JsonSchema::from_value(&r);
+                state
+                    .write()
+                    .schemas
+                    .insert_cache(fetch_uri, schema.clone());
+                schema
+            })
         }
+        SchemaLookup::None => None,
     };
 
-    // Now take a single consistent snapshot for all diagnostics.
-    let state = state.read();
-    let doc = match state.documents.get(uri) {
-        Some(d) => d,
-        None => return,
-    };
-
-    let mut diags = diagnostics::syntax_diagnostics(doc);
-    let version = Some(doc.version);
-
-    let has_schema = schema.is_some();
+    // Run schema validation if syntax is clean.
     if let Some(schema) = schema {
         if diags.is_empty() {
-            if let Some(root) = tree::root_value(&doc.tree) {
-                let mut regex_cache = regex_cache.lock();
-                let val_errors =
-                    validation::validate(root, doc.source(), &schema, &mut regex_cache);
-                for ve in &val_errors {
-                    diags.push(lsp_types::Diagnostic {
-                        range: doc.range_of(ve.start_byte, ve.end_byte),
-                        severity: Some(match ve.severity {
-                            validation::Severity::Error => DiagnosticSeverity::ERROR,
-                            validation::Severity::Warning => DiagnosticSeverity::WARNING,
-                        }),
-                        source: Some("json".into()),
-                        message: ve.message.clone(),
-                        ..lsp_types::Diagnostic::default()
-                    });
+            let state = state.read();
+            if let Some(doc) = state.documents.get(uri) {
+                if let Some(root) = tree::root_value(&doc.tree) {
+                    let mut regex_cache = regex_cache.lock();
+                    let val_errors =
+                        validation::validate(root, doc.source(), &schema, &mut regex_cache);
+                    for ve in &val_errors {
+                        diags.push(lsp_types::Diagnostic {
+                            range: doc.range_of(ve.start_byte, ve.end_byte),
+                            severity: Some(match ve.severity {
+                                validation::Severity::Error => DiagnosticSeverity::ERROR,
+                                validation::Severity::Warning => DiagnosticSeverity::WARNING,
+                            }),
+                            source: Some("json".into()),
+                            message: ve.message.clone(),
+                            ..lsp_types::Diagnostic::default()
+                        });
+                    }
                 }
             }
         }
     }
-    log(format!(
-        "[validate] publishing {} diags, version={:?}, schema={}",
-        diags.len(),
-        version,
-        has_schema,
-    ));
-
-    drop(state);
 
     let params = PublishDiagnosticsParams {
         uri: uri.clone(),
