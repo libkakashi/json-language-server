@@ -12,7 +12,7 @@ Benchmarked against [vscode-json-languageservice](https://github.com/microsoft/v
 
 ### Latency
 
-| Scenario | Size | Metric | json-language-server (Rust) | vscode-json-languageservice (Node) | Winner |
+| Scenario | Size | Metric | Rust | Node | Winner |
 |---|---|---|--:|--:|---|
 | **Startup** | — | p50 | 7.06 | 51.5 | Rust (7.3x) |
 | | — | p95 | 7.68 | 56.8 | Rust (7.4x) |
